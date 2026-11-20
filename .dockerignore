@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+.envrc
+.github
+ci
+node_modules
+*.log
+.DS_Store
+README.md
+*.md
+Dockerfile
+.dockerignore

@@ -1,0 +1,128 @@
+name: Docker Image CI
+
+on:
+  push:
+    branches: ["*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      HARBOR_REGISTRY_URL: ${{ vars.HARBOR_REGISTRY_URL }}
+      HARBOR_PROJECT: ${{ vars.HARBOR_PROJECT }}
+      IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Skip `docker login` — its daemon preflight ping to /v2/ gets a 403 from
+      # Harbor/Cloudflare before credentials are even used. BuildKit's push does
+      # the normal challenge/token flow, so a hand-built auth config is enough.
+      - name: Log in to Harbor Registry
+        env:
+          HARBOR_REGISTRY_URL: ${{ vars.HARBOR_REGISTRY_URL }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          AUTH_DIR="${RUNNER_TEMP}/harbor-auth"
+          mkdir -p "${AUTH_DIR}"
+          cat > "${AUTH_DIR}/config.json" <<EOF
+          {
+            "auths": {
+              "${HARBOR_REGISTRY_URL}": {
+                "auth": "$(printf '%s' "${HARBOR_USERNAME}:${HARBOR_PASSWORD}" | base64 -w0)"
+              }
+            }
+          }
+          EOF
+          echo "DOCKER_CONFIG=${AUTH_DIR}" >> "${GITHUB_ENV}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: |
+            ${{ vars.HARBOR_REGISTRY_URL }}/${{ vars.HARBOR_PROJECT }}/${{ vars.IMAGE_NAME }}:latest
+            ${{ vars.HARBOR_REGISTRY_URL }}/${{ vars.HARBOR_PROJECT }}/${{ vars.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Verify the pushed image
+        run: |
+          docker buildx imagetools inspect ${{ vars.HARBOR_REGISTRY_URL }}/${{ vars.HARBOR_PROJECT }}/${{ vars.IMAGE_NAME }}:${{ github.sha }} | tee manifest.txt
+          grep -q 'linux/amd64' manifest.txt
+          grep -q 'linux/arm64' manifest.txt
+          echo "✅ Multi-arch manifest contains both amd64 and arm64"
+
+      - name: Checkout deployment-manifests repo
+        uses: actions/checkout@v4
+        with:
+          repository: rahulkj/deployment-manifests
+          token: ${{ secrets.DEPLOY_PAT }}
+          path: deployment-manifests
+
+      - name: Install envsubst
+        run: sudo apt-get install -y gettext-base
+
+      - name: Generate PI deployment manifest
+        env:
+          VERSION: ${{ github.sha }}
+          SITE_NAME: ${{ vars.SITE_NAME }}
+          PLATFORM: ${{ vars.PI_PLATFORM }}
+          DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
+          HARBOR_REGISTRY_URL: ${{ vars.HARBOR_REGISTRY_URL }}
+          HARBOR_PROJECT: ${{ vars.HARBOR_PROJECT }}
+          IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+        run: |
+          cd deployment-manifests
+          mkdir -p pi
+          envsubst < ${{ github.workspace }}/ci/deployment.yml > pi/${{ vars.IMAGE_NAME }}-deployment.yaml
+
+      - name: Commit and push manifest
+        working-directory: deployment-manifests
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pi/${{ vars.IMAGE_NAME }}-deployment.yaml
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update ${{ vars.IMAGE_NAME }} deployment to version ${{ github.sha }}"
+            git push
+          fi
+
+  cleanup:
+    name: 🧹 Cleanup Actions storage
+    needs: build
+    if: ${{ !cancelled() && !failure() }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete artifacts of this run
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runId = ${{ github.run_id }};
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            core.info(`Cleaning artifacts for run ${runId}`);
+            let page = 1;
+            while (true) {
+              const { data } = await github.rest.actions.listWorkflowRunArtifacts({
+                owner, repo, run_id: runId, per_page: 100, page,
+              });
+              for (const artifact of data.artifacts) {
+                await github.rest.actions.deleteArtifact({ owner, repo, artifact_id: artifact.id });
+                core.info(`deleted artifact ${artifact.name} (${artifact.id}, ${artifact.size_in_bytes} bytes)`);
+              }
+              if (data.artifacts.length < 100) break;
+              page++;
+            }
